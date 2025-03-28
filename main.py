@@ -4,13 +4,20 @@ import aiosqlite
 import os
 import asyncio
 import time
+import sys
+import atexit
+import signal
 from typing import Any, Optional, List, Dict, Union
 from discord import app_commands
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta, timezone
+import bot_status
 
 # Global dictionary to store warnings (will be replaced with DB storage in a future update)
 warnings_db = {}
+
+# Global dictionary to store active countdowns
+active_countdowns = {}
 
 # Bot Setup
 intents = discord.Intents.default()
@@ -103,6 +110,8 @@ command_permissions = {
     "stopevents": [1308527904497340467, 479711321399623681], # Owner ID + specified user
     "givepermission": [1308527904497340467, 479711321399623681], # Owner ID + Crowic - Critical command for permission management
     "setpublic": [1308527904497340467, 479711321399623681], # Owner ID + specified user - Critical command for permission management
+    "countdown": [1308527904497340467, 479711321399623681], # Owner ID + specified user - Only these two users can run the countdown
+    "status": [1308527904497340467, 479711321399623681], # Owner ID + specified user - Control bot status messages
     
     # All other commands require owner permission by default
 }
@@ -371,12 +380,73 @@ ITEM_EMOJIS = {
 XP_DROP_CHANNEL_ID = 1340427534944309249  # Replace with your XP Drop channel ID
 XP_DROP_INTERVAL = 3600  # 1 hour (in seconds)
 
+# Bot Status Message Settings
+bot_status_message_id = None  # Will store the current status message ID
+
+
+# Function to create and initialize the bot status table
+async def setup_bot_status_table():
+    try:
+        async with aiosqlite.connect("leveling.db") as db:
+            # Create bot status message table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS bot_status (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    message_id INTEGER,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.commit()
+            print("Bot status table created successfully")
+    except Exception as e:
+        print(f"Error creating bot status table: {e}")
+        
+# Function to set the bot status to offline when shutting down
+async def set_bot_offline():
+    """Update the bot status message to offline before shutting down"""
+    try:
+        global bot_status_message_id
+        if bot_status_message_id:
+            success = await bot_status.set_bot_status_offline(bot, bot_status_message_id)
+            if success:
+                print(f"✅ Set bot status to offline (message ID: {bot_status_message_id})")
+                return True
+            else:
+                print(f"❌ Failed to set bot status to offline (message ID: {bot_status_message_id})")
+                return False
+        return False
+    except Exception as e:
+        print(f"❌ Error setting bot status to offline: {e}")
+        return False
+        
+async def set_bot_maintenance():
+    """Update the bot status message to maintenance mode"""
+    try:
+        global bot_status_message_id
+        if bot_status_message_id:
+            success = await bot_status.set_bot_status_maintenance(bot, bot_status_message_id)
+            if success:
+                print(f"✅ Set bot status to maintenance (message ID: {bot_status_message_id})")
+                return True
+            else:
+                print(f"❌ Failed to set bot status to maintenance (message ID: {bot_status_message_id})")
+                return False
+        else:
+            print("❌ No bot status message ID found")
+            return False
+    except Exception as e:
+        print(f"❌ Error setting bot status to maintenance: {e}")
+        return False
 
 # Database Setup
 async def setup_db():
     try:
         from setup_db_updated import setup_db as setup_db_updated
         await setup_db_updated()
+        
+        # Set up the bot status table
+        await setup_bot_status_table()
+        
         print("Database setup completed using setup_db_updated function")
         
         # Add server stats tables
@@ -1205,6 +1275,41 @@ async def on_ready():
         print(f"❌ Failed to sync commands: {e}")
     print(f'✅ Logged in as {bot.user}!')
     print(f'📦 Loaded {len(SHOP_ITEMS)} shop items from database')
+    
+    # Create or update bot status message
+    try:
+        global bot_status_message_id
+        
+        # Try to load existing status message ID from database
+        async with aiosqlite.connect("leveling.db") as db:
+            cursor = await db.execute("SELECT message_id FROM bot_status WHERE id = 1")
+            result = await cursor.fetchone()
+            if result and result[0]:
+                bot_status_message_id = result[0]
+                print(f"✅ Loaded existing bot status message ID: {bot_status_message_id}")
+            else:
+                print("❌ No existing bot status message found in database")
+        
+        # Create or update the bot status message
+        new_message_id = await bot_status.create_or_update_bot_status_message(bot, bot_status_message_id)
+        
+        # If message ID changed, update it in the database
+        if new_message_id != bot_status_message_id:
+            bot_status_message_id = new_message_id
+            
+            # Save message ID to database
+            async with aiosqlite.connect("leveling.db") as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO bot_status (id, message_id, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP)",
+                    (bot_status_message_id,)
+                )
+                await db.commit()
+                print(f"✅ Updated bot status message ID in database: {bot_status_message_id}")
+    except Exception as e:
+        print(f"❌ Error setting up bot status message: {e}")
+    
+    # This line is no longer needed as we call the status update from bot_status module directly above
+    # await create_or_update_bot_status_message()
     
     # Start the automatic backup task in the background
     auto_backup_task.start()
@@ -7652,9 +7757,361 @@ class CheckWarningsModal(discord.ui.Modal, title="Check Member Warnings"):
         except Exception as e:
             await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
 
+# Countdown command
+@bot.tree.command(name="countdown", description="Start a countdown timer that will send messages at specified intervals")
+async def countdown(
+    interaction: discord.Interaction,
+    duration: int,
+    time_unit: str,
+    interval: str,
+    channel: discord.TextChannel = None
+):
+    """
+    Start a countdown timer that sends messages at specified intervals.
+    
+    Parameters:
+    - duration: The total duration for the countdown
+    - time_unit: Unit for the duration (min/hour/day)
+    - interval: How often to send updates (format: 30m, 1h, 2d)
+    - channel: The channel to send countdown messages to (default: current channel)
+    
+    Examples:
+    /countdown 60 min 10m #announcements
+    /countdown 24 hour 1h #general
+    /countdown 7 day 1d #events
+    """
+    # Only allow two specific users to use this command
+    if interaction.user.id not in [1308527904497340467, 479711321399623681]:
+        await interaction.response.send_message("❌ You don't have permission to use this command!", ephemeral=True)
+        return
+    
+    # Set the channel to current channel if not specified
+    if channel is None:
+        channel = interaction.channel
+    
+    # Validate time units
+    valid_units = {
+        "min": 60,
+        "hour": 3600,
+        "day": 86400
+    }
+    
+    # Convert duration to seconds
+    if time_unit.lower() not in valid_units:
+        await interaction.response.send_message(
+            f"❌ Invalid time unit! Please use one of: {', '.join(valid_units.keys())}", 
+            ephemeral=True
+        )
+        return
+    
+    total_seconds = duration * valid_units[time_unit.lower()]
+    
+    # Parse interval (e.g., "30m", "1h", "12h", "1d")
+    interval_value = ""
+    interval_unit = ""
+    for char in interval:
+        if char.isdigit():
+            interval_value += char
+        else:
+            interval_unit += char
+    
+    # Validate interval format
+    if not interval_value or not interval_unit:
+        await interaction.response.send_message(
+            "❌ Invalid interval format! Use format like 30m, 1h, or 1d.", 
+            ephemeral=True
+        )
+        return
+    
+    # Map interval unit to seconds
+    interval_unit = interval_unit.lower()
+    interval_unit_mapping = {
+        "m": 60,
+        "min": 60,
+        "h": 3600,
+        "hour": 3600,
+        "d": 86400,
+        "day": 86400
+    }
+    
+    if interval_unit not in interval_unit_mapping:
+        await interaction.response.send_message(
+            f"❌ Invalid interval unit! Please use one of: m, h, d", 
+            ephemeral=True
+        )
+        return
+    
+    # Calculate interval in seconds
+    interval_seconds = int(interval_value) * interval_unit_mapping[interval_unit]
+    
+    # Ensure interval isn't larger than total countdown
+    if interval_seconds > total_seconds:
+        await interaction.response.send_message(
+            "❌ Interval cannot be larger than the total countdown duration!", 
+            ephemeral=True
+        )
+        return
+    
+    # Create a unique ID for this countdown
+    countdown_id = f"{interaction.user.id}_{int(time.time())}"
+    
+    # Calculate end time
+    end_time = discord.utils.utcnow() + timedelta(seconds=total_seconds)
+    
+    # Store countdown info
+    active_countdowns[countdown_id] = {
+        "channel_id": channel.id,
+        "end_time": end_time,
+        "interval": interval_seconds,
+        "last_message": discord.utils.utcnow(),
+        "total_seconds": total_seconds
+    }
+    
+    # Create confirmation embed
+    embed = discord.Embed(
+        title="⏰ Countdown Timer Started",
+        description=f"Countdown for {duration} {time_unit}(s) has been started!",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="⏱️ Duration",
+        value=f"{duration} {time_unit}(s) ({total_seconds} seconds)"
+    )
+    
+    embed.add_field(
+        name="🔄 Update Interval",
+        value=f"Every {interval} ({interval_seconds} seconds)"
+    )
+    
+    embed.add_field(
+        name="🏁 End Time",
+        value=f"<t:{int(end_time.timestamp())}:F> (<t:{int(end_time.timestamp())}:R>)"
+    )
+    
+    embed.add_field(
+        name="📢 Channel",
+        value=channel.mention,
+        inline=False
+    )
+    
+    # Send confirmation
+    await interaction.response.send_message(embed=embed)
+    
+    # Send initial countdown message to the target channel
+    remaining = total_seconds
+    days, remainder = divmod(remaining, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    time_parts = []
+    if days > 0:
+        time_parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours > 0:
+        time_parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes > 0:
+        time_parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if seconds > 0 and not (days > 0 or hours > 0 or minutes > 0):
+        time_parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+    
+    time_str = ", ".join(time_parts)
+    
+    initial_embed = discord.Embed(
+        title="⏰ Countdown Started",
+        description=f"Time remaining: **{time_str}**",
+        color=discord.Color.gold()
+    )
+    
+    initial_embed.add_field(
+        name="⏱️ Ends At",
+        value=f"<t:{int(end_time.timestamp())}:F> (<t:{int(end_time.timestamp())}:R>)"
+    )
+    
+    # Send initial message
+    countdown_msg = await channel.send(embed=initial_embed)
+    
+    # Start countdown task
+    async def countdown_task():
+        try:
+            # Continue until countdown is done
+            while discord.utils.utcnow() < end_time:
+                # Wait for the next interval
+                await asyncio.sleep(interval_seconds)
+                
+                # Get remaining time
+                remaining = (end_time - discord.utils.utcnow()).total_seconds()
+                if remaining <= 0:
+                    break
+                
+                # Calculate time components
+                days, remainder = divmod(int(remaining), 86400)
+                hours, remainder = divmod(remainder, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                
+                time_parts = []
+                if days > 0:
+                    time_parts.append(f"{days} day{'s' if days != 1 else ''}")
+                if hours > 0:
+                    time_parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+                if minutes > 0:
+                    time_parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+                if seconds > 0 and not (days > 0 or hours > 0 or minutes > 0):
+                    time_parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+                
+                time_str = ", ".join(time_parts)
+                
+                # Create update embed
+                update_embed = discord.Embed(
+                    title="⏰ Countdown Update",
+                    description=f"Time remaining: **{time_str}**",
+                    color=discord.Color.gold()
+                )
+                
+                update_embed.add_field(
+                    name="⏱️ Ends At",
+                    value=f"<t:{int(end_time.timestamp())}:F> (<t:{int(end_time.timestamp())}:R>)"
+                )
+                
+                # Send update
+                try:
+                    target_channel = bot.get_channel(channel.id)
+                    if target_channel:
+                        await target_channel.send(embed=update_embed)
+                except Exception as e:
+                    print(f"Error sending countdown update: {e}")
+            
+            # Final message
+            try:
+                final_embed = discord.Embed(
+                    title="⏰ Countdown Finished!",
+                    description="The countdown has ended!",
+                    color=discord.Color.green()
+                )
+                
+                target_channel = bot.get_channel(channel.id)
+                if target_channel:
+                    await target_channel.send(embed=final_embed)
+            except Exception as e:
+                print(f"Error sending final countdown message: {e}")
+                
+            # Remove countdown from active countdowns
+            if countdown_id in active_countdowns:
+                del active_countdowns[countdown_id]
+                
+        except asyncio.CancelledError:
+            # Handle cancellation
+            if countdown_id in active_countdowns:
+                del active_countdowns[countdown_id]
+            print(f"Countdown {countdown_id} cancelled")
+        except Exception as e:
+            print(f"Error in countdown task: {e}")
+            # Clean up on error
+            if countdown_id in active_countdowns:
+                del active_countdowns[countdown_id]
+    
+    # Start the countdown task
+    bot.loop.create_task(countdown_task())
+
+# Status command to control bot status messages
+@bot.tree.command(name="status", description="Send a status message or update the bot status")
+@app_commands.describe(
+    status_type="The type of status message to send (on, off, maintenance)",
+    update_persistent="Whether to update the persistent bot status message (default: False)"
+)
+@app_commands.choices(status_type=[
+    app_commands.Choice(name="Bot Online", value="on"),
+    app_commands.Choice(name="Bot Offline", value="off"),
+    app_commands.Choice(name="Bot Maintenance", value="maintenance")
+])
+async def status_command(
+    interaction: discord.Interaction, 
+    status_type: str,
+    update_persistent: bool = False
+):
+    """
+    Send a status message to the designated status channel or update the persistent bot status.
+    
+    Parameters:
+    - status_type: The type of status message to send (on, off, maintenance)
+    - update_persistent: Whether to update the persistent bot status message (True/False)
+    
+    Only certain roles can use this command.
+    """
+    global bot_status_message_id
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if the user has permission
+    if interaction.user.id not in [1308527904497340467, 479711321399623681]:
+        await interaction.followup.send("❌ You don't have permission to use this command!", ephemeral=True)
+        return
+    
+    # If update_persistent is True, update the persistent bot status message
+    if update_persistent:
+        if status_type == "on":
+            # Update to online
+            new_message_id = await bot_status.create_or_update_bot_status_message(bot, bot_status_message_id)
+            if new_message_id:
+                bot_status_message_id = new_message_id
+                await interaction.followup.send("✅ Updated persistent bot status to online", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Failed to update persistent bot status to online", ephemeral=True)
+        elif status_type == "off":
+            # Update to offline
+            await bot_status.set_bot_status_offline(bot, bot_status_message_id)
+            await interaction.followup.send("✅ Updated persistent bot status to offline", ephemeral=True)
+        elif status_type == "maintenance":
+            # Update to maintenance
+            success = await set_bot_maintenance()
+            if success:
+                await interaction.followup.send("✅ Updated persistent bot status to maintenance", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Failed to update persistent bot status to maintenance", ephemeral=True)
+        return
+    
+    # Otherwise, just send a status message (non-persistent)
+    success = await bot_status.send_status_message(bot, status_type)
+    
+    if success:
+        await interaction.followup.send(f"✅ Status message sent successfully: {status_type}", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ Failed to send status message. Please check the logs.", ephemeral=True)
+
+# Define shutdown handlers
+def handle_exit_signal(signum, frame):
+    """Handle exit signals to gracefully shut down the bot"""
+    print(f"Received exit signal: {signum}")
+    
+    # Schedule the offline status update in the event loop
+    # This needs to run before the bot shuts down
+    if bot.loop.is_running():
+        bot.loop.create_task(set_bot_offline())
+        
+        # Let the offline status task complete before exiting
+        import time
+        time.sleep(1)  # Small delay to allow the task to run
+        
+    print("Bot is shutting down...")
+    
+    # This will raise SystemExit and allow bot.close() to be called
+    import sys
+    sys.exit(0)
+
+# Register the signal handlers
+signal.signal(signal.SIGINT, handle_exit_signal)  # Handles Ctrl+C
+signal.signal(signal.SIGTERM, handle_exit_signal)  # Handles termination signal
+
+# Get bot token from environment
 TOKEN = os.getenv('DISCORD_TOKEN')
 if not TOKEN:
     print("⚠️ Please set the DISCORD_TOKEN environment variable with your bot token!")
     exit(1)
 
-bot.run(TOKEN)
+try:
+    bot.run(TOKEN)
+except KeyboardInterrupt:
+    print("Bot stopped by keyboard interrupt")
+except Exception as e:
+    print(f"Bot stopped due to error: {e}")
+finally:
+    print("Bot has been shut down")

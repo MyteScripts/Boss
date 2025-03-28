@@ -10,6 +10,7 @@ import datetime
 from discord import app_commands
 from discord.ext import commands
 from typing import Dict, Optional, List, Tuple
+from db_pool import get_db_pool
 
 # Invite tracking cache
 guild_invites = {}
@@ -545,6 +546,77 @@ async def set_user_invites(user_id, guild_id, count):
             ''', (user_id, guild_id, count))
         
         await db.commit()
+        
+async def reset_user_invites(user_id, guild_id):
+    """Reset a user's invite count to zero."""
+    try:
+        # Try using the DB pool
+        db_pool = await get_db_pool()
+        
+        # Reset the user's bonus invites to 0
+        await db_pool.execute('''
+            UPDATE invite_counts
+            SET regular = 0, leaves = 0, fake = 0, bonus = 0
+            WHERE user_id = ? AND guild_id = ?
+        ''', (user_id, guild_id))
+        
+        return True
+    except Exception as e:
+        print(f"⚠️ Couldn't use DB pool for reset_user_invites, falling back to direct connection: {e}")
+        
+        # Fallback to direct connection
+        async with aiosqlite.connect("leveling.db") as db:
+            await db.execute('''
+                UPDATE invite_counts
+                SET regular = 0, leaves = 0, fake = 0, bonus = 0
+                WHERE user_id = ? AND guild_id = ?
+            ''', (user_id, guild_id))
+            
+            await db.commit()
+            
+        return True
+
+async def reset_all_invites(guild_id):
+    """Reset invite counts for all users in a guild."""
+    try:
+        # Try using the DB pool
+        db_pool = await get_db_pool()
+        await db_pool.execute('''
+            UPDATE invite_counts
+            SET regular = 0, leaves = 0, fake = 0, bonus = 0
+            WHERE guild_id = ?
+        ''', (guild_id,))
+        
+        # Get the number of users affected
+        cursor = await db_pool.fetchall('''
+            SELECT COUNT(*)
+            FROM invite_counts
+            WHERE guild_id = ?
+        ''', (guild_id,))
+        
+        return cursor[0][0] if cursor else 0
+    except Exception as e:
+        print(f"⚠️ Couldn't use DB pool for reset_all_invites, falling back to direct connection: {e}")
+        
+        # Fallback to direct connection
+        async with aiosqlite.connect("leveling.db") as db:
+            await db.execute('''
+                UPDATE invite_counts
+                SET regular = 0, leaves = 0, fake = 0, bonus = 0
+                WHERE guild_id = ?
+            ''', (guild_id,))
+            
+            # Get the number of users affected
+            cursor = await db.execute('''
+                SELECT COUNT(*)
+                FROM invite_counts
+                WHERE guild_id = ?
+            ''', (guild_id,))
+            
+            count = await cursor.fetchone()
+            await db.commit()
+            
+            return count[0] if count else 0
 
 async def add_user_bonus_invites(user_id, guild_id, amount):
     """Add bonus invites to a user."""
@@ -1102,6 +1174,138 @@ class InviteTracker(commands.Cog):
         except Exception as e:
             print(f"Error in /setinvites command: {e}")
             await interaction.followup.send("❌ An error occurred while updating invite count.", ephemeral=True)
+    
+    @app_commands.command(name="resetinvites", description="Reset invite counts for a member or all members")
+    @app_commands.default_permissions(administrator=True)
+    async def resetinvites(
+        self, 
+        interaction: discord.Interaction, 
+        member: Optional[discord.Member] = None,
+        all_members: Optional[bool] = False
+    ):
+        """
+        Reset invite counts for a specific member or all members.
+        
+        Parameters:
+        - member: The member to reset invites for (optional)
+        - all_members: Set to True to reset invites for all members (optional)
+        """
+        try:
+            # Check if in DM - need to verify admin status differently in DMs
+            if not interaction.guild:
+                # Only super admins can use this in DMs
+                if interaction.user.id not in [1308527904497340467, 479711321399623681]:
+                    await interaction.response.send_message("❌ This command can only be used by server admins.", ephemeral=True)
+                    return
+            else:
+                # In a guild, check for admin permissions
+                if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+                    await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+                    return
+            
+            # Validate parameters
+            if not member and not all_members:
+                await interaction.response.send_message(
+                    "❌ You must either specify a member or set all_members to True.", 
+                    ephemeral=True
+                )
+                return
+                
+            await interaction.response.defer()
+            
+            # Reset invites based on parameters
+            if all_members:
+                # Reset all invites in the server
+                affected_count = await reset_all_invites(interaction.guild.id)
+                
+                embed = discord.Embed(
+                    title="Invites Reset",
+                    description=f"✅ Successfully reset invite counts for all members in the server.",
+                    color=discord.Color.green()
+                )
+                
+                embed.add_field(
+                    name="Affected Members",
+                    value=f"{affected_count} member{'s' if affected_count != 1 else ''}"
+                )
+                
+                embed.set_footer(text=f"Reset by {interaction.user.name}")
+                
+                await interaction.followup.send(embed=embed)
+                
+                # Log the reset to the logs channel
+                logs_channel = await self.get_logs_channel()
+                if logs_channel:
+                    log_embed = discord.Embed(
+                        title="Server Invites Reset",
+                        description=f"{interaction.user.mention} has reset invite counts for all members",
+                        color=discord.Color.yellow()
+                    )
+                    
+                    log_embed.add_field(
+                        name="Affected Members",
+                        value=f"{affected_count} member{'s' if affected_count != 1 else ''}"
+                    )
+                    
+                    log_embed.set_footer(text=f"Reset by {interaction.user.name} ({interaction.user.id})")
+                    log_embed.timestamp = datetime.datetime.now()
+                    
+                    try:
+                        await logs_channel.send(embed=log_embed)
+                    except discord.HTTPException as e:
+                        print(f"Failed to send invite reset log: {e}")
+            else:
+                # Reset invites for a specific member
+                if member is None:
+                    await interaction.followup.send("❌ No member specified for reset.", ephemeral=True)
+                    return
+                
+                # Get the current counts before reset
+                before_counts = await get_invite_counts(member.id, interaction.guild.id)
+                
+                # Reset the member's invites
+                await reset_user_invites(member.id, interaction.guild.id)
+                
+                # Get the updated counts
+                after_counts = await get_invite_counts(member.id, interaction.guild.id)
+                
+                embed = discord.Embed(
+                    title="Invites Reset",
+                    description=f"✅ Successfully reset invite count for {member.mention}",
+                    color=discord.Color.green()
+                )
+                
+                embed.add_field(name="Before", value=str(before_counts.get("total", 0)), inline=True)
+                embed.add_field(name="After", value=str(after_counts.get("total", 0)), inline=True)
+                
+                embed.set_thumbnail(url=member.display_avatar.url)
+                embed.set_footer(text=f"Reset by {interaction.user.name}")
+                
+                await interaction.followup.send(embed=embed)
+                
+                # Log the reset to the logs channel
+                logs_channel = await self.get_logs_channel()
+                if logs_channel:
+                    log_embed = discord.Embed(
+                        title="Member Invites Reset",
+                        description=f"{interaction.user.mention} has reset invite count for {member.mention}",
+                        color=discord.Color.yellow()
+                    )
+                    
+                    log_embed.add_field(name="Before", value=str(before_counts.get("total", 0)), inline=True)
+                    log_embed.add_field(name="After", value=str(after_counts.get("total", 0)), inline=True)
+                    
+                    log_embed.set_thumbnail(url=member.display_avatar.url)
+                    log_embed.set_footer(text=f"Reset by {interaction.user.name} ({interaction.user.id})")
+                    log_embed.timestamp = datetime.datetime.now()
+                    
+                    try:
+                        await logs_channel.send(embed=log_embed)
+                    except discord.HTTPException as e:
+                        print(f"Failed to send invite reset log: {e}")
+        except Exception as e:
+            print(f"Error in /resetinvites command: {e}")
+            await interaction.followup.send("❌ An error occurred while resetting invite count.", ephemeral=True)
     
     @app_commands.command(name="inviterewardlogs", description="View the logs of invite rewards")
     @app_commands.default_permissions(administrator=True)

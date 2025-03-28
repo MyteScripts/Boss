@@ -611,6 +611,42 @@ async def update_investments():
                 ''', (user_id, inv_type, "shutdown", 
                      f"Your {investment['name']} has shut down due to lack of maintenance.", 
                      0, now))
+                
+                # Send DM notification about shutdown
+                try:
+                    # Get instance of bot from the global namespace 
+                    from main import bot
+                    
+                    # Create embedded message with shutdown alert
+                    embed = discord.Embed(
+                        title="🚫 Business Shutdown Alert!",
+                        description=f"Your {INVESTMENTS[inv_type]['name']} has shut down due to lack of maintenance!",
+                        color=discord.Color.dark_red()
+                    )
+                    
+                    embed.add_field(
+                        name="💼 Business",
+                        value=f"{INVESTMENTS[inv_type]['emoji']} {INVESTMENTS[inv_type]['name']}",
+                        inline=True
+                    )
+                    
+                    embed.add_field(
+                        name="🔧 Maintenance",
+                        value="0% (Critical Failure)",
+                        inline=True
+                    )
+                    
+                    embed.add_field(
+                        name="🔄 Recovery Instructions",
+                        value=f"Use `/investment buy {inv_type}` to reopen your business for **{INVESTMENTS[inv_type]['cost']}** coins.",
+                        inline=False
+                    )
+                    
+                    # Get the user and send DM
+                    user = await bot.fetch_user(user_id)
+                    await user.send(embed=embed)
+                except Exception as e:
+                    print(f"Failed to send shutdown DM to user {user_id}: {e}")
         
         await db.commit()
 
@@ -1032,28 +1068,21 @@ class InvestmentCommands(commands.Cog):
                     )
                     return
                 
-                # Calculate maintenance from collected coins (50% goes to maintenance)
-                maintenance_amount = collected_coins // 2
-                coins_to_user = collected_coins - maintenance_amount
+                # The user gets all coins (no automatic maintenance repair)
+                coins_to_user = collected_coins
                 
-                # Calculate how much maintenance will increase
-                # Each maintenance point costs 1% of max_holding
-                maintenance_cost_per_point = investment["max_holding"] * 0.01
-                maintenance_points_gained = min(100 - maintenance, int(maintenance_amount / maintenance_cost_per_point))
-                new_maintenance = min(100, maintenance + maintenance_points_gained)
-                
-                # Add the remaining coins to user balance
+                # Add the coins to user balance
                 await db.execute(
                     'UPDATE users SET coins = coins + ? WHERE user_id = ?',
                     (coins_to_user, user_id)
                 )
                 
-                # Reset the collected coins in the investment and update maintenance
+                # Reset the collected coins in the investment but don't change maintenance
                 await db.execute('''
                     UPDATE investments
-                    SET collected_coins = 0, maintenance = ?
+                    SET collected_coins = 0
                     WHERE id = ?
-                ''', (new_maintenance, inv_id))
+                ''', (inv_id,))
                 
                 await db.commit()
                 
@@ -1063,36 +1092,24 @@ class InvestmentCommands(commands.Cog):
                     color=discord.Color.gold()
                 )
                 
-                # Add fields showing how coins were distributed
+                # Display current maintenance level
                 embed.add_field(
-                    name="💸 Coins to Pocket",
-                    value=f"**{coins_to_user}** coins (50%)",
-                    inline=True
-                )
-                
-                embed.add_field(
-                    name="🔧 Maintenance Investment",
-                    value=f"**{maintenance_amount}** coins (50%)",
-                    inline=True
-                )
-                
-                embed.add_field(
-                    name="🔄 Maintenance Level",
-                    value=f"Increased from **{maintenance:.1f}%** to **{new_maintenance:.1f}%**",
+                    name="🔄 Current Maintenance Level",
+                    value=f"**{maintenance:.1f}%**",
                     inline=False
                 )
                 
                 # Show maintenance status with appropriate emoji based on level
-                if new_maintenance < 25:
+                if maintenance < 25:
                     embed.add_field(
                         name="🚨 Critical Warning",
-                        value=f"Your business is still in poor condition! Currently at **{new_maintenance:.1f}%**\nUse `/investment maintain` to improve further!",
+                        value=f"Your business is in poor condition! Currently at **{maintenance:.1f}%**\nUse `/investment maintain` to restore it!",
                         inline=False
                     )
-                elif new_maintenance < 50:
+                elif maintenance < 50:
                     embed.add_field(
                         name="⚠️ Warning",
-                        value=f"Your business needs more maintenance. Currently at **{new_maintenance:.1f}%**",
+                        value=f"Your business needs maintenance. Currently at **{maintenance:.1f}%**\nUse `/investment maintain` to restore it!",
                         inline=False
                     )
                     
@@ -1132,122 +1149,92 @@ class InvestmentCommands(commands.Cog):
                     )
                     return
                 
-                # Allow user to choose how much maintenance to perform
-                # Since repairs are only allowed when maintenance is below 50%,
-                # give options for 50% and 100% as repair targets
-                maintenance_options = [50, 100]
-                valid_options = [opt for opt in maintenance_options if opt > current_maintenance]
+                # When maintenance is between 0-50%, always restore directly to 100%
+                target_maintenance = 100
+                maintenance_needed = target_maintenance - current_maintenance
+                maintenance_cost = int((maintenance_needed / 100) * investment["max_holding"])
                 
-                if not valid_options:
-                    # This should rarely happen, but just in case
-                    await interaction.response.send_message(
-                        f"Your {investment['name']} is already in good condition at {current_maintenance:.1f}%!",
-                        ephemeral=True
-                    )
-                    return
-                
-                # Create options for maintenance levels
-                options = []
-                for target in valid_options:
-                    # Calculate maintenance needed and cost
-                    maintenance_needed = target - current_maintenance
-                    maintenance_cost = int((maintenance_needed / 100) * investment["max_holding"])
-                    
-                    # Add option
-                    options.append({
-                        "target": target,
-                        "needed": maintenance_needed,
-                        "cost": maintenance_cost
-                    })
-                
-                # Create embed with maintenance options
-                embed = discord.Embed(
-                    title=f"🔧 {investment['emoji']} Maintenance Options",
-                    description=f"Choose a maintenance level for your {investment['name']}:",
-                    color=discord.Color.blue()
-                )
-                
-                # Check if user has enough coins for any option
+                # Check if user has enough coins
                 cursor = await db.execute('SELECT coins FROM users WHERE user_id = ?', (user_id,))
                 user_coins = (await cursor.fetchone())[0]
                 
-                # Add field for each option
-                for option in options:
-                    can_afford = "✅" if user_coins >= option["cost"] else "❌"
-                    embed.add_field(
-                        name=f"{can_afford} Restore to {option['target']}%",
-                        value=f"Cost: **{option['cost']}** coins\nImproves by: **+{option['needed']}%**",
-                        inline=True
-                    )
+                # Create embed with maintenance information
+                embed = discord.Embed(
+                    title=f"🔧 {investment['emoji']} Maintenance Repair",
+                    description=f"Repair your {investment['name']} to 100% condition:",
+                    color=discord.Color.blue()
+                )
                 
-                # Create maintenance selection view
-                class MaintenanceView(discord.ui.View):
+                can_afford = user_coins >= maintenance_cost
+                embed.add_field(
+                    name=f"{'✅' if can_afford else '❌'} Restore to 100%",
+                    value=f"Cost: **{maintenance_cost}** coins\nImproves by: **+{maintenance_needed:.1f}%**",
+                    inline=True
+                )
+                
+                if not can_afford:
+                    embed.add_field(
+                        name="❌ Insufficient Funds",
+                        value=f"You need **{maintenance_cost}** coins but only have **{user_coins}** coins.",
+                        inline=False
+                    )
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                    return
+                
+                # Create confirmation view
+                class ConfirmRepairView(discord.ui.View):
                     def __init__(self):
                         super().__init__(timeout=60)
                         
-                    @discord.ui.select(
-                        placeholder="Select maintenance level",
-                        options=[
-                            discord.SelectOption(
-                                label=f"Restore to {option['target']}%", 
-                                description=f"Cost: {option['cost']} coins",
-                                value=str(i)
-                            ) for i, option in enumerate(options)
-                        ]
-                    )
-                    async def select_maintenance(self, interaction: discord.Interaction, select: discord.ui.Select):
-                        # Get selected option
-                        option_index = int(select.values[0])
-                        selected = options[option_index]
-                        
-                        # Check if user can afford
-                        if user_coins < selected["cost"]:
-                            await interaction.response.send_message(
-                                f"You don't have enough coins! You need {selected['cost']} coins, but only have {user_coins}.",
-                                ephemeral=True
-                            )
-                            return
-                        
+                    @discord.ui.button(label="Confirm Repair", style=discord.ButtonStyle.green)
+                    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
                         # Deduct the cost
                         await db.execute(
                             'UPDATE users SET coins = coins - ? WHERE user_id = ?',
-                            (selected["cost"], user_id)
+                            (maintenance_cost, user_id)
                         )
                         
-                        # Update the maintenance
+                        # Update the maintenance to 100%
                         await db.execute('''
                             UPDATE investments
-                            SET maintenance = ?
+                            SET maintenance = 100
                             WHERE id = ?
-                        ''', (selected["target"], inv_id))
+                        ''', (inv_id,))
                         
                         await db.commit()
                         
                         # Create response embed
                         result_embed = discord.Embed(
                             title=f"🔧 {investment['emoji']} Maintenance Complete!",
-                            description=f"You've improved your {investment['name']} to **{selected['target']}%** condition!",
+                            description=f"You've fully repaired your {investment['name']} to **100%** condition!",
                             color=discord.Color.green()
                         )
                         
                         result_embed.add_field(
                             name="💰 Cost",
-                            value=f"**{selected['cost']}** coins",
+                            value=f"**{maintenance_cost}** coins",
                             inline=True
                         )
                         
                         result_embed.add_field(
                             name="📈 Improvement",
-                            value=f"**{current_maintenance:.1f}%** → **{selected['target']}%**",
+                            value=f"**{current_maintenance:.1f}%** → **100%**",
                             inline=True
                         )
                         
-                        # Disable the select menu
-                        self.children[0].disabled = True
+                        # Disable all buttons
+                        for child in self.children:
+                            child.disabled = True
+                            
                         await interaction.response.edit_message(embed=result_embed, view=self)
-                
-                # Send the view
-                await interaction.response.send_message(embed=embed, view=MaintenanceView())
+                    
+                    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+                    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                        await interaction.response.send_message("Repair cancelled.", ephemeral=True)
+                        # Disable all buttons
+                        for child in self.children:
+                            child.disabled = True
+                        await interaction.message.edit(view=self)
                 
                 # Add an appropriate emoji based on the previous condition
                 # Since repairs are only allowed when maintenance is below 50%,
@@ -1267,7 +1254,8 @@ class InvestmentCommands(commands.Cog):
                 
                 embed.set_footer(text=f"⏰ Maintenance drains at a rate of {investment['maintenance_drain']}% per hour")
                 
-                await interaction.response.send_message(embed=embed)
+                # Send the confirmation view
+                await interaction.response.send_message(embed=embed, view=ConfirmRepairView())
         
         else:
             await interaction.response.send_message(
